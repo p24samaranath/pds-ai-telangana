@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Environment / Secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+nohup.out
+
+# ML Models & checkpoints
+backend/data/models/*.pt
+backend/data/models/*.pkl
+backend/data/models/*.onnx
+*.pt
+*.pkl
+
+# Raw data CSVs (large, fetchable via the data fetcher)
+backend/data/raw/*.csv
+backend/data/raw/*.json
+backend/data/processed/*.csv
+backend/data/processed/*.json
+backend/data/cache/
+# Keep directory structure
+!backend/data/raw/.gitkeep
+!backend/data/processed/.gitkeep
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local session data
+.claude/
+
+# Misc
+*.tmp
+*.bak
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.phcode.json
