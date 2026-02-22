@@ -15,6 +15,7 @@ aiosqlite>=0.19.0
 
 # AI / LLM
 anthropic>=0.18.1
+google-genai>=1.0.0          # Google Gemini fallback (use when GEMINI_API_KEY is set)
 
 # ML & Data Science — CPU-only torch (no CUDA, ~200 MB vs ~700 MB)
 --extra-index-url https://download.pytorch.org/whl/cpu

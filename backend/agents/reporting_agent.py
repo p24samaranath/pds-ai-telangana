@@ -4,13 +4,20 @@ Synthesises outputs from all agents into dashboards, reports, and NL query respo
 
 Phase 3 upgrade: RAG-enabled NL chatbot
 - Indexes all agent outputs into an in-memory TF-IDF vector store (RAGStore)
-- Retrieves the top-k most relevant chunks before every Claude call
+- Retrieves the top-k most relevant chunks before every LLM call
 - Maintains per-session conversation history for multi-turn dialogue
+
+LLM Fallback Chain (in priority order):
+  1. Anthropic Claude  — primary; used when ANTHROPIC_API_KEY is set
+  2. Google Gemini     — fallback; used when GEMINI_API_KEY is set and Claude fails/unavailable
+  3. Rule-based text   — final safety net; always works, no API key needed
 """
 import pandas as pd
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import logging
+
+# ── LLM client imports (each guarded so missing packages never crash startup) ──
 
 try:
     from anthropic import Anthropic
@@ -18,12 +25,18 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    from google import genai as google_genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 from app.config import settings
 from services.rag_store import RAGStore
 
 logger = logging.getLogger(__name__)
 
-# Number of RAG chunks to include in each Claude prompt
+# Number of RAG chunks to include in each LLM prompt
 RAG_TOP_K = 6
 # Maximum conversation turns kept per session (to stay within context limits)
 MAX_HISTORY_TURNS = 10
@@ -36,16 +49,118 @@ class ReportingAgent:
 
     RAG chatbot architecture:
       1. index() — agent outputs → RAGStore (TF-IDF vectors)
-      2. answer_nl_query() — query → retrieve top-k chunks → Claude with context
+      2. answer_nl_query() — query → retrieve top-k chunks → LLM with context
       3. Conversation history — per session_id, up to MAX_HISTORY_TURNS turns
+
+    LLM fallback chain:
+      Anthropic Claude  →  Google Gemini  →  Rule-based text
     """
 
     def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if ANTHROPIC_AVAILABLE else None
+        # ── Anthropic client ────────────────────────────────────────────────
+        self.anthropic_client: Optional[Any] = None
+        if ANTHROPIC_AVAILABLE and settings.ANTHROPIC_API_KEY:
+            try:
+                self.anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                logger.info("ReportingAgent: Anthropic Claude client initialised")
+            except Exception as e:
+                logger.warning(f"ReportingAgent: Anthropic init failed — {e}")
+
+        # ── Google Gemini client (google-genai SDK) ─────────────────────────
+        self.gemini_client: Optional[Any] = None
+        if GEMINI_AVAILABLE and settings.GEMINI_API_KEY:
+            try:
+                self.gemini_client = google_genai.Client(api_key=settings.GEMINI_API_KEY)
+                logger.info(
+                    f"ReportingAgent: Google Gemini client initialised "
+                    f"(model={settings.GEMINI_MODEL})"
+                )
+            except Exception as e:
+                logger.warning(f"ReportingAgent: Gemini init failed — {e}")
+
+        # Log active LLM
+        if self.anthropic_client:
+            logger.info("ReportingAgent: active LLM = Anthropic Claude (primary)")
+        elif self.gemini_client:
+            logger.info("ReportingAgent: active LLM = Google Gemini (fallback)")
+        else:
+            logger.warning(
+                "ReportingAgent: no LLM API key configured — "
+                "using rule-based fallback only. "
+                "Set ANTHROPIC_API_KEY or GEMINI_API_KEY in .env"
+            )
+
         self.rag_store = RAGStore()
         # conversation_history: {session_id: [{"role": ..., "content": ...}, ...]}
         self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
         self._last_indexed_at: Optional[str] = None
+
+    # ── LLM Call Helper ────────────────────────────────────────────────────────
+
+    def _call_llm(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: str,
+        max_tokens: int = 800,
+    ) -> tuple[str, str]:
+        """
+        Try LLMs in priority order: Anthropic → Gemini → fallback.
+
+        Returns (answer_text, llm_used) where llm_used is one of:
+          "claude", "gemini", "fallback"
+        """
+        # 1. Anthropic Claude
+        if self.anthropic_client:
+            try:
+                response = self.anthropic_client.messages.create(
+                    model=settings.CLAUDE_MODEL,
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=messages,
+                )
+                return response.content[0].text, "claude"
+            except Exception as e:
+                logger.warning(
+                    f"Anthropic Claude call failed ({e}); trying Gemini fallback…"
+                )
+
+        # 2. Google Gemini (google-genai SDK)
+        if self.gemini_client:
+            try:
+                from google.genai import types as genai_types
+
+                # Build a flat contents list for the new SDK.
+                # Convert role "assistant" → "model" as Gemini requires.
+                # Prepend the system instruction into the first user turn.
+                contents = []
+                for i, msg in enumerate(messages):
+                    role = "model" if msg["role"] == "assistant" else "user"
+                    text = msg["content"]
+                    # Inject system prompt before the first user message
+                    if i == 0 and msg["role"] == "user":
+                        text = f"{system_prompt}\n\n{text}"
+                    contents.append(
+                        genai_types.Content(
+                            role=role,
+                            parts=[genai_types.Part(text=text)],
+                        )
+                    )
+
+                response = self.gemini_client.models.generate_content(
+                    model=settings.GEMINI_MODEL,
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                return response.text, "gemini"
+            except Exception as e:
+                logger.warning(
+                    f"Google Gemini call failed ({e}); falling back to rule-based response"
+                )
+
+        # 3. Rule-based fallback (always succeeds)
+        return None, "fallback"
 
     # ── RAG Indexing ───────────────────────────────────────────────────────────
 
@@ -161,7 +276,11 @@ class ReportingAgent:
         geo_results: Dict,
         district: Optional[str] = None,
     ) -> str:
-        """Generate a human-readable executive summary via Claude."""
+        """
+        Generate a human-readable executive summary.
+
+        Tries Claude → Gemini → rule-based fallback.
+        """
         context = f"""
 PDS System Status Report — {datetime.utcnow().strftime('%B %Y')}
 District focus: {district or 'All Telangana'}
@@ -183,26 +302,21 @@ GEOSPATIAL:
 - New FPS recommendations: {len(geo_results.get('new_location_recommendations', []))}
 - Underperforming shops: {len(geo_results.get('underperforming_shops', []))}
 """
-        if not ANTHROPIC_AVAILABLE or not self.client:
+        system_prompt = (
+            "You are a senior analyst for India's Public Distribution System. "
+            "Write a concise 3-paragraph executive summary for district officials "
+            "based on this data. Highlight the most urgent actions needed."
+        )
+        messages = [{"role": "user", "content": context}]
+
+        answer, llm_used = self._call_llm(messages, system_prompt, max_tokens=600)
+
+        if llm_used == "fallback" or answer is None:
+            logger.info("generate_executive_summary: using rule-based fallback")
             return self._fallback_summary(fraud_results, forecast_results, geo_results)
 
-        try:
-            response = self.client.messages.create(
-                model=settings.CLAUDE_MODEL,
-                max_tokens=600,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"You are a senior analyst for India's Public Distribution System. "
-                        f"Write a concise 3-paragraph executive summary for district officials "
-                        f"based on this data. Highlight the most urgent actions needed.\n\n{context}"
-                    ),
-                }],
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            return self._fallback_summary(fraud_results, forecast_results, geo_results)
+        logger.info(f"generate_executive_summary: answered via {llm_used}")
+        return answer
 
     def _fallback_summary(self, fraud: Dict, forecast: Dict, geo: Dict) -> str:
         crit = fraud.get("summary", {}).get("critical", 0)
@@ -232,16 +346,16 @@ GEOSPATIAL:
         session_id: str = "default",
     ) -> Dict[str, Any]:
         """
-        Answer a natural language question from a PDS official using RAG + Claude.
+        Answer a natural language question from a PDS official using RAG + LLM.
 
         Flow:
           1. Retrieve top-k relevant chunks from RAGStore
-          2. Build Claude prompt with retrieved context + conversation history
-          3. Call Claude (or fallback)
+          2. Build LLM prompt with retrieved context + conversation history
+          3. Call LLM (Claude → Gemini → rule-based fallback)
           4. Append turn to session history
         """
         # --- Step 1: Auto-index if the store is empty (first call) ---
-        if not self.rag_store._fitted:
+        if not self.rag_store.is_fitted:
             self.index_agent_outputs(
                 fraud_results=fraud_results,
                 forecast_results=forecast_results,
@@ -254,14 +368,6 @@ GEOSPATIAL:
         retrieved_context = self.rag_store.retrieve_as_text(query, k=RAG_TOP_K)
         rag_chunks = self.rag_store.retrieve(query, k=RAG_TOP_K)
         rag_sources = list({doc.source for doc, _ in rag_chunks})
-
-        if not ANTHROPIC_AVAILABLE or not self.client:
-            answer = (
-                f"Query received: '{query}'. Claude API unavailable — "
-                f"configure ANTHROPIC_API_KEY.\n\n"
-                f"Retrieved context (top {RAG_TOP_K} chunks):\n{retrieved_context}"
-            )
-            return self._build_response(query, answer, session_id, rag_sources, retrieved_context)
 
         # --- Step 3: Build conversation history for this session ---
         history = self._get_history(session_id)
@@ -286,23 +392,27 @@ GEOSPATIAL:
             "If the context doesn't contain enough information, say so rather than guessing."
         )
 
-        # --- Step 4: Call Claude ---
-        try:
-            response = self.client.messages.create(
-                model=settings.CLAUDE_MODEL,
-                max_tokens=800,
-                system=system_prompt,
-                messages=messages,
-            )
-            answer = response.content[0].text
-        except Exception as e:
-            logger.error(f"NL query Claude error: {e}")
-            answer = f"Unable to process query. Error: {str(e)}"
+        # --- Step 4: Call LLM with fallback chain ---
+        answer, llm_used = self._call_llm(messages, system_prompt, max_tokens=800)
 
-        # --- Step 5: Persist turn to history ---
+        if llm_used == "fallback" or answer is None:
+            logger.info(f"answer_nl_query [{session_id}]: using rule-based fallback")
+            answer = (
+                f"Query received: '{query}'.\n\n"
+                f"No LLM API key is configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY). "
+                f"Here is the raw retrieved context that would have been used to answer:\n\n"
+                f"{retrieved_context}"
+            )
+            llm_used = "fallback"
+        else:
+            logger.info(f"answer_nl_query [{session_id}]: answered via {llm_used}")
+
+        # --- Step 5: Persist turn to history (store raw query, not context) ---
         self._append_history(session_id, query, answer)
 
-        return self._build_response(query, answer, session_id, rag_sources, retrieved_context)
+        return self._build_response(
+            query, answer, session_id, rag_sources, retrieved_context, llm_used
+        )
 
     def _build_response(
         self,
@@ -311,11 +421,12 @@ GEOSPATIAL:
         session_id: str,
         rag_sources: List[str],
         retrieved_context: str,
+        llm_used: str = "claude",
     ) -> Dict[str, Any]:
         return {
             "query": query,
             "answer": answer,
-            "agent_used": "reporting_rag",
+            "agent_used": f"reporting_rag/{llm_used}",
             "session_id": session_id,
             "conversation_turn": len(self._get_history(session_id)) // 2,
             "rag_sources": rag_sources,

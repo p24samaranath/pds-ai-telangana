@@ -12,6 +12,7 @@ alembic>=1.12.1
 
 # AI / LLM
 anthropic>=0.18.1
+google-genai>=1.0.0          # Google Gemini fallback (use when GEMINI_API_KEY is set)
 
 # ML & Data Science
 # CPU-only torch (~200 MB vs ~700 MB GPU build) — sufficient for inference on Render free tier

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # Google Gemini (fallback LLM when Anthropic key is unavailable)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+
     # ML Model Settings
     FRAUD_ALERT_THRESHOLD: float = 0.6
     FORECAST_LOOKAHEAD_DAYS: int = 90
