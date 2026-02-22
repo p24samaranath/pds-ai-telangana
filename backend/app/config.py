@@ -2,6 +2,14 @@ from pydantic_settings import BaseSettings
 from typing import Optional
 import os
 
+# Pre-load .env into os.environ using python-dotenv so that pydantic-settings
+# can reliably pick up API keys that contain special characters (hyphens, etc.)
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
+except ImportError:
+    pass
+
 
 class Settings(BaseSettings):
     # Application
@@ -26,7 +34,7 @@ class Settings(BaseSettings):
 
     # Google Gemini (fallback LLM when Anthropic key is unavailable)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # ML Model Settings
     FRAUD_ALERT_THRESHOLD: float = 0.6
