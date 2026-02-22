@@ -60,8 +60,22 @@ export const getOrchestratorStatus = () =>
 export const runFullPipeline = () =>
   api.post('/api/v1/agents/run/full').then(r => r.data);
 
-export const submitNLQuery = (query) =>
-  api.post('/api/v1/agents/query', { query }).then(r => r.data);
+// Legacy single-turn query (kept for backwards compatibility)
+export const submitNLQuery = (query, sessionId = 'default') =>
+  api.post('/api/v1/agents/query', { query, session_id: sessionId }).then(r => r.data);
+
+// Multi-turn RAG chat — use this for the chat interface
+export const sendChatMessage = (query, sessionId = 'default') =>
+  api.post('/api/v1/agents/chat', { query, session_id: sessionId }).then(r => r.data);
+
+export const listChatSessions = () =>
+  api.get('/api/v1/agents/chat/sessions').then(r => r.data);
+
+export const clearChatSession = (sessionId) =>
+  api.delete(`/api/v1/agents/chat/sessions/${sessionId}`).then(r => r.data);
+
+export const getRagStats = () =>
+  api.get('/api/v1/agents/chat/rag/stats').then(r => r.data);
 
 // ── Data Management ────────────────────────────────────────────────────────
 

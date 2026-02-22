@@ -53,10 +53,16 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS — allow React frontend
+# CORS — allow React frontend (dev) and GitHub Pages (prod)
+# NOTE: allow_credentials=True is incompatible with allow_origins=["*"]
+_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://samaranathreddymukka.github.io",  # GitHub Pages deployment
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

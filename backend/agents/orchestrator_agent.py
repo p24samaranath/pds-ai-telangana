@@ -32,6 +32,7 @@ class OrchestratorState(TypedDict, total=False):
     geo_results: Dict
     reporting_results: Dict
     nl_query: Optional[str]
+    session_id: str        # Chat session for multi-turn RAG history
     trigger: str           # "monthly", "realtime", "query", "geo_change"
     errors: List[str]
     started_at: str
@@ -186,7 +187,7 @@ class OrchestratorAgent:
         state["geo_results"] = geo_results
         self._memory["last_geo_analysis"] = datetime.utcnow().isoformat()
 
-        # Step 4 — Reporting
+        # Step 4 — Reporting (re-indexes RAG store with fresh pipeline results)
         reporting_results = await self.reporting_agent.run(
             shops_df=shops_df,
             beneficiaries_df=beneficiaries_df,
@@ -195,6 +196,7 @@ class OrchestratorAgent:
             forecast_results=forecast_results,
             geo_results=geo_results,
             nl_query=state.get("nl_query"),
+            session_id=state.get("session_id", "default"),
         )
         state["reporting_results"] = reporting_results
 
@@ -226,6 +228,7 @@ class OrchestratorAgent:
             forecast_results=state.get("forecast_results", {}),
             geo_results=state.get("geo_results", {}),
             nl_query=state.get("nl_query"),
+            session_id=state.get("session_id", "default"),
         )
         state["reporting_results"] = reporting_results
         return state
@@ -239,6 +242,7 @@ class OrchestratorAgent:
         beneficiaries_df: pd.DataFrame,
         transactions_df: pd.DataFrame,
         nl_query: Optional[str] = None,
+        session_id: str = "default",
         commodities: Optional[List[CommodityType]] = None,
     ) -> Dict[str, Any]:
         """
@@ -253,6 +257,7 @@ class OrchestratorAgent:
             "beneficiaries_df": beneficiaries_df,
             "transactions_df": transactions_df,
             "nl_query": nl_query,
+            "session_id": session_id,
             "trigger": trigger.value,
             "errors": [],
             "started_at": started_at.isoformat(),

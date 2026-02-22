@@ -87,10 +87,11 @@ maintains shared memory of decisions, generates executive summaries.
 - Seasonal encoding (festivals, harvest cycles)
 
 ### Fraud Detection Agent
-**Models:** Rule Engine + Isolation Forest + DBSCAN
+**Models:** Rule Engine + Isolation Forest + DBSCAN + Graph Fraud Ring Detector
 - **Rule Engine:** Duplicate cards, after-hours transactions, month-end bulk fraud, low biometric rate
 - **Isolation Forest:** Point anomalies across 7 transaction features
 - **DBSCAN:** Coordinated fraud cluster detection
+- **Graph Fraud Ring Detector:** Bipartite card-shop transaction graph + community detection (NetworkX) to surface organised fraud rings; scores rings by multi-shop card ratio, biometric miss rate, graph density, and PageRank hub centrality
 
 ### Geospatial Optimizer Agent
 **Models:** K-Means + Voronoi Tessellation
@@ -102,7 +103,8 @@ maintains shared memory of decisions, generates executive summaries.
 ### Reporting Agent
 - Dashboard metrics aggregation
 - AI-generated executive summaries (Claude)
-- Natural language query answering
+- **RAG chatbot** — TF-IDF vector store over indexed agent outputs; retrieves top-6 relevant chunks per query before calling Claude
+- **Multi-turn conversation** — per-session history (up to 10 turns); session management via `/api/v1/agents/chat`
 - Role-based views for different stakeholders
 
 ---
@@ -147,6 +149,10 @@ maintains shared memory of decisions, generates executive summaries.
 | GET | `/api/v1/geo/underserved-zones` | Underserved beneficiary zones |
 | GET | `/api/v1/geo/recommendations` | New FPS location recommendations |
 | GET | `/api/v1/dashboard/metrics` | Dashboard KPIs |
+| POST | `/api/v1/agents/chat` | Multi-turn RAG chatbot |
+| GET | `/api/v1/agents/chat/sessions` | List active chat sessions |
+| DELETE | `/api/v1/agents/chat/sessions/{id}` | Clear a session |
+| GET | `/api/v1/agents/chat/rag/stats` | RAG store statistics |
 
 ---
 
@@ -191,8 +197,13 @@ maintains shared memory of decisions, generates executive summaries.
 |-------|-------|--------|
 | 1 — Foundation | Data pipeline, baseline models, basic dashboard | ✅ Complete |
 | 2 — Core Agents | DBSCAN + IF fraud, geospatial optimizer, LangGraph | ✅ Complete |
-| 3 — Advanced | GNN fraud rings, RAG chatbot, auto-retraining | 🔄 In Progress |
+| 3 — Advanced | Graph fraud rings (NetworkX), RAG chatbot, auto-retraining | ✅ Complete |
 | 4 — Scale | Multi-state expansion, fairness audits, DPDP compliance | 📋 Planned |
+
+**Phase 3 progress:**
+- ✅ Graph Fraud Ring Detector — bipartite card-shop graph + community detection + PageRank scoring (`ml_models/fraud_detection/graph_fraud_detector.py`)
+- ✅ Auto-retraining — MAPE-triggered LSTM/Prophet retraining in `DemandForecastAgent`
+- ✅ RAG chatbot — TF-IDF in-memory vector store (`services/rag_store.py`), top-k retrieval grounding every Claude call, multi-turn session history (`agents/reporting_agent.py`)
 
 ---
 

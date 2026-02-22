@@ -166,6 +166,7 @@ class AgentQueryRequest(BaseModel):
     query: str
     context: Optional[Dict[str, Any]] = None
     agent_hint: Optional[str] = None
+    session_id: str = "default"
 
 
 class AgentQueryResponse(BaseModel):
@@ -174,6 +175,29 @@ class AgentQueryResponse(BaseModel):
     agent_used: str
     data: Optional[Dict[str, Any]] = None
     generated_at: datetime
+
+
+# ── RAG Chat ──────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    query: str
+    session_id: str = "default"
+
+
+class ChatResponse(BaseModel):
+    query: str
+    answer: str
+    session_id: str
+    conversation_turn: int
+    rag_sources: List[str]
+    agent_used: str
+    generated_at: datetime
+
+
+class ChatSessionInfo(BaseModel):
+    session_id: str
+    turns: int
+    messages: int
 
 
 class OrchestratorStatus(BaseModel):

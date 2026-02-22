@@ -1,6 +1,11 @@
 """
 Reporting & Alerting Agent
 Synthesises outputs from all agents into dashboards, reports, and NL query responses.
+
+Phase 3 upgrade: RAG-enabled NL chatbot
+- Indexes all agent outputs into an in-memory TF-IDF vector store (RAGStore)
+- Retrieves the top-k most relevant chunks before every Claude call
+- Maintains per-session conversation history for multi-turn dialogue
 """
 import pandas as pd
 from typing import Dict, List, Any, Optional
@@ -14,21 +19,64 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 from app.config import settings
+from services.rag_store import RAGStore
 
 logger = logging.getLogger(__name__)
+
+# Number of RAG chunks to include in each Claude prompt
+RAG_TOP_K = 6
+# Maximum conversation turns kept per session (to stay within context limits)
+MAX_HISTORY_TURNS = 10
 
 
 class ReportingAgent:
     """
     Synthesises multi-agent outputs into human-readable reports and
     answers natural language queries from PDS officials.
+
+    RAG chatbot architecture:
+      1. index() — agent outputs → RAGStore (TF-IDF vectors)
+      2. answer_nl_query() — query → retrieve top-k chunks → Claude with context
+      3. Conversation history — per session_id, up to MAX_HISTORY_TURNS turns
     """
 
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if ANTHROPIC_AVAILABLE else None
-        self._context_store: Dict[str, Any] = {}   # In-memory context (replace with vector DB)
+        self.rag_store = RAGStore()
+        # conversation_history: {session_id: [{"role": ..., "content": ...}, ...]}
+        self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
+        self._last_indexed_at: Optional[str] = None
 
-    # ── Dashboard Metrics ─────────────────────────────────────────────────────
+    # ── RAG Indexing ───────────────────────────────────────────────────────────
+
+    def index_agent_outputs(
+        self,
+        fraud_results: Dict,
+        forecast_results: Dict,
+        geo_results: Dict,
+        shops_df: Optional[pd.DataFrame] = None,
+        beneficiaries_df: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        """
+        Index all agent outputs into the RAG store.
+        Call this after each pipeline run so the chatbot has up-to-date context.
+        """
+        n_docs = self.rag_store.index(
+            fraud_results=fraud_results,
+            forecast_results=forecast_results,
+            geo_results=geo_results,
+            shops_df=shops_df,
+            beneficiaries_df=beneficiaries_df,
+        )
+        self._last_indexed_at = datetime.utcnow().isoformat()
+        logger.info(f"ReportingAgent: RAG store indexed {n_docs} documents")
+        return {
+            "indexed_documents": n_docs,
+            "indexed_at": self._last_indexed_at,
+            "store_stats": self.rag_store.stats(),
+        }
+
+    # ── Dashboard Metrics ──────────────────────────────────────────────────────
 
     def build_dashboard_metrics(
         self,
@@ -44,7 +92,6 @@ class ReportingAgent:
         active_shops = int(shops_df["is_active"].sum()) if "is_active" in shops_df.columns else total_shops
         total_bene = len(beneficiaries_df)
 
-        # Transactions this month
         now = datetime.utcnow()
         txn_month = transactions_df.copy()
         if "transaction_date" in txn_month.columns:
@@ -54,19 +101,16 @@ class ReportingAgent:
                 & (txn_month["transaction_date"].dt.month == now.month)
             ]
 
-        # Fraud summary
         fraud_summary = fraud_results.get("summary", {})
         total_alerts = fraud_summary.get("total_alerts", 0)
         critical_alerts = fraud_summary.get("critical", 0)
+        fraud_rings = fraud_summary.get("fraud_rings_detected", 0)
 
-        # Forecast accuracy
         forecasts = forecast_results.get("forecasts", [])
         avg_accuracy = 0.90  # Placeholder until actual MAPE is computed
 
-        # Geo accessibility
         pct_within_3km = geo_results.get("pct_beneficiaries_within_threshold_km", 0)
 
-        # Monthly distribution by commodity
         monthly_dist = {}
         if "commodity" in transactions_df.columns and "quantity_kg" in transactions_df.columns:
             monthly_dist = (
@@ -76,7 +120,6 @@ class ReportingAgent:
                 .to_dict()
             )
 
-        # Top fraud districts
         fraud_alerts = fraud_results.get("alerts", [])
         district_fraud: Dict[str, int] = {}
         for alert in fraud_alerts:
@@ -99,6 +142,7 @@ class ReportingAgent:
             "transactions_this_month": len(txn_month),
             "fraud_alerts_open": total_alerts,
             "fraud_alerts_critical": critical_alerts,
+            "fraud_rings_detected": fraud_rings,
             "avg_forecast_accuracy": avg_accuracy,
             "beneficiaries_within_3km_pct": pct_within_3km,
             "districts_covered": beneficiaries_df["district"].nunique()
@@ -108,7 +152,7 @@ class ReportingAgent:
             "last_updated": now.isoformat(),
         }
 
-    # ── Executive Summary ─────────────────────────────────────────────────────
+    # ── Executive Summary ──────────────────────────────────────────────────────
 
     async def generate_executive_summary(
         self,
@@ -126,6 +170,7 @@ FRAUD DETECTION:
 - Total alerts: {fraud_results.get('summary', {}).get('total_alerts', 0)}
 - Critical: {fraud_results.get('summary', {}).get('critical', 0)}
 - High: {fraud_results.get('summary', {}).get('high', 0)}
+- Fraud rings detected: {fraud_results.get('summary', {}).get('fraud_rings_detected', 0)}
 - Transactions analysed: {fraud_results.get('summary', {}).get('transactions_analysed', 0)}
 
 DEMAND FORECAST:
@@ -138,7 +183,6 @@ GEOSPATIAL:
 - New FPS recommendations: {len(geo_results.get('new_location_recommendations', []))}
 - Underperforming shops: {len(geo_results.get('underperforming_shops', []))}
 """
-
         if not ANTHROPIC_AVAILABLE or not self.client:
             return self._fallback_summary(fraud_results, forecast_results, geo_results)
 
@@ -162,19 +206,20 @@ GEOSPATIAL:
 
     def _fallback_summary(self, fraud: Dict, forecast: Dict, geo: Dict) -> str:
         crit = fraud.get("summary", {}).get("critical", 0)
+        rings = fraud.get("summary", {}).get("fraud_rings_detected", 0)
         risk = forecast.get("total_risk_flags", 0)
         underserved = geo.get("underserved_count", 0)
         return (
             f"PDS System Report — {datetime.utcnow().strftime('%B %Y')}\n\n"
             f"Fraud Detection: {fraud.get('summary', {}).get('total_alerts', 0)} alerts raised, "
-            f"including {crit} critical cases requiring immediate attention.\n\n"
+            f"including {crit} critical cases and {rings} coordinated fraud rings requiring immediate attention.\n\n"
             f"Demand Forecasting: {forecast.get('total_forecasts', 0)} forecasts generated "
             f"with {risk} stock risk flags identified.\n\n"
             f"Geospatial: {underserved} beneficiaries are currently underserved (>5 km from FPS). "
             f"Accessibility score: {geo.get('overall_accessibility_score', 0):.1%}."
         )
 
-    # ── Natural Language Query ────────────────────────────────────────────────
+    # ── RAG-Powered NL Query ───────────────────────────────────────────────────
 
     async def answer_nl_query(
         self,
@@ -184,64 +229,136 @@ GEOSPATIAL:
         fraud_results: Dict,
         geo_results: Dict,
         forecast_results: Dict,
+        session_id: str = "default",
     ) -> Dict[str, Any]:
         """
-        Answer a natural language question from a PDS official using agent outputs.
+        Answer a natural language question from a PDS official using RAG + Claude.
+
+        Flow:
+          1. Retrieve top-k relevant chunks from RAGStore
+          2. Build Claude prompt with retrieved context + conversation history
+          3. Call Claude (or fallback)
+          4. Append turn to session history
         """
-        # Build structured context
-        context_data = {
-            "fraud_summary": fraud_results.get("summary", {}),
-            "total_alerts": len(fraud_results.get("alerts", [])),
-            "underserved_zones": len(geo_results.get("underserved_zones", [])),
-            "new_shop_recommendations": geo_results.get("new_location_recommendations", [])[:3],
-            "risk_flags": forecast_results.get("risk_flags", [])[:5],
-        }
+        # --- Step 1: Auto-index if the store is empty (first call) ---
+        if not self.rag_store._fitted:
+            self.index_agent_outputs(
+                fraud_results=fraud_results,
+                forecast_results=forecast_results,
+                geo_results=geo_results,
+                shops_df=shops_df,
+                beneficiaries_df=beneficiaries_df,
+            )
+
+        # --- Step 2: Retrieve relevant context ---
+        retrieved_context = self.rag_store.retrieve_as_text(query, k=RAG_TOP_K)
+        rag_chunks = self.rag_store.retrieve(query, k=RAG_TOP_K)
+        rag_sources = list({doc.source for doc, _ in rag_chunks})
 
         if not ANTHROPIC_AVAILABLE or not self.client:
-            return {
-                "query": query,
-                "answer": f"Query received: '{query}'. Claude API unavailable — please configure ANTHROPIC_API_KEY.",
-                "agent_used": "reporting_fallback",
-                "data": context_data,
-                "generated_at": datetime.utcnow().isoformat(),
-            }
+            answer = (
+                f"Query received: '{query}'. Claude API unavailable — "
+                f"configure ANTHROPIC_API_KEY.\n\n"
+                f"Retrieved context (top {RAG_TOP_K} chunks):\n{retrieved_context}"
+            )
+            return self._build_response(query, answer, session_id, rag_sources, retrieved_context)
+
+        # --- Step 3: Build conversation history for this session ---
+        history = self._get_history(session_id)
+
+        # Build the user turn: retrieved context + question
+        user_content = (
+            f"RETRIEVED CONTEXT (from PDS knowledge base — use this to answer):\n"
+            f"{retrieved_context}\n\n"
+            f"OFFICIAL QUERY: {query}"
+        )
+
+        messages = history + [{"role": "user", "content": user_content}]
 
         system_prompt = (
-            "You are an AI assistant for India's PDS (Public Distribution System). "
+            "You are an AI assistant for India's Public Distribution System (PDS) in Telangana. "
             "You have access to real-time data on FPS shops, beneficiaries, fraud alerts, "
-            "demand forecasts, and geospatial coverage analysis. "
-            "Answer questions concisely and accurately. "
-            "If recommending actions, be specific. "
-            "Always cite data when making claims."
+            "demand forecasts, geospatial coverage, and coordinated fraud ring analysis. "
+            "Each turn you will receive RETRIEVED CONTEXT — the most relevant facts from the "
+            "live knowledge base. Use this context to ground your answers in real data. "
+            "Be concise, specific, and cite numbers when available. "
+            "If recommending actions, be precise. "
+            "If the context doesn't contain enough information, say so rather than guessing."
         )
 
-        user_message = (
-            f"Official query: {query}\n\n"
-            f"Current system data:\n{context_data}\n\n"
-            "Please provide a clear, actionable answer."
-        )
-
+        # --- Step 4: Call Claude ---
         try:
             response = self.client.messages.create(
                 model=settings.CLAUDE_MODEL,
                 max_tokens=800,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
+                messages=messages,
             )
             answer = response.content[0].text
         except Exception as e:
             logger.error(f"NL query Claude error: {e}")
-            answer = f"Unable to process query at this time. Error: {str(e)}"
+            answer = f"Unable to process query. Error: {str(e)}"
 
+        # --- Step 5: Persist turn to history ---
+        self._append_history(session_id, query, answer)
+
+        return self._build_response(query, answer, session_id, rag_sources, retrieved_context)
+
+    def _build_response(
+        self,
+        query: str,
+        answer: str,
+        session_id: str,
+        rag_sources: List[str],
+        retrieved_context: str,
+    ) -> Dict[str, Any]:
         return {
             "query": query,
             "answer": answer,
-            "agent_used": "reporting",
-            "data": context_data,
+            "agent_used": "reporting_rag",
+            "session_id": session_id,
+            "conversation_turn": len(self._get_history(session_id)) // 2,
+            "rag_sources": rag_sources,
+            "retrieved_context": retrieved_context,
+            "rag_store_stats": self.rag_store.stats(),
             "generated_at": datetime.utcnow().isoformat(),
         }
 
-    # ── Full Reporting Run ────────────────────────────────────────────────────
+    # ── Conversation History Management ───────────────────────────────────────
+
+    def _get_history(self, session_id: str) -> List[Dict[str, str]]:
+        return self._conversation_history.get(session_id, [])
+
+    def _append_history(self, session_id: str, query: str, answer: str) -> None:
+        """
+        Append a user+assistant turn to the session history.
+        Stores only the raw query (not the retrieved context) as the user message
+        so future turns have a clean conversation log.
+        """
+        history = self._conversation_history.setdefault(session_id, [])
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": answer})
+        # Trim to MAX_HISTORY_TURNS (each turn = 2 messages)
+        if len(history) > MAX_HISTORY_TURNS * 2:
+            self._conversation_history[session_id] = history[-(MAX_HISTORY_TURNS * 2):]
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear conversation history for a session."""
+        self._conversation_history.pop(session_id, None)
+        logger.info(f"ReportingAgent: cleared session '{session_id}'")
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all active sessions with their turn counts."""
+        return [
+            {
+                "session_id": sid,
+                "turns": len(hist) // 2,
+                "messages": len(hist),
+            }
+            for sid, hist in self._conversation_history.items()
+        ]
+
+    # ── Full Reporting Run ─────────────────────────────────────────────────────
 
     async def run(
         self,
@@ -252,8 +369,18 @@ GEOSPATIAL:
         forecast_results: Dict,
         geo_results: Dict,
         nl_query: Optional[str] = None,
+        session_id: str = "default",
     ) -> Dict[str, Any]:
-        """Compile all reporting outputs."""
+        """Compile all reporting outputs and (re)index the RAG store."""
+        # Always re-index after a fresh pipeline run
+        index_info = self.index_agent_outputs(
+            fraud_results=fraud_results,
+            forecast_results=forecast_results,
+            geo_results=geo_results,
+            shops_df=shops_df,
+            beneficiaries_df=beneficiaries_df,
+        )
+
         dashboard = self.build_dashboard_metrics(
             shops_df, beneficiaries_df, transactions_df,
             fraud_results, forecast_results, geo_results,
@@ -268,6 +395,7 @@ GEOSPATIAL:
             nl_response = await self.answer_nl_query(
                 nl_query, shops_df, beneficiaries_df,
                 fraud_results, geo_results, forecast_results,
+                session_id=session_id,
             )
 
         return {
@@ -275,5 +403,6 @@ GEOSPATIAL:
             "dashboard_metrics": dashboard,
             "executive_summary": summary,
             "nl_query_response": nl_response,
+            "rag_index": index_info,
             "generated_at": datetime.utcnow().isoformat(),
         }

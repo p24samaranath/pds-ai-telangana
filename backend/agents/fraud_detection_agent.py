@@ -1,7 +1,7 @@
 """
 Fraud Detection Agent
 Continuously monitors PDS transactions for anomalous and fraudulent patterns.
-Combines rule engine + Isolation Forest + DBSCAN.
+Combines rule engine + Isolation Forest + DBSCAN + Graph Fraud Ring Detector.
 """
 import pandas as pd
 import numpy as np
@@ -12,6 +12,7 @@ import logging
 
 from ml_models.fraud_detection.rule_engine import RuleBasedFraudDetector
 from ml_models.fraud_detection.isolation_forest import IsolationForestDetector, DBSCANFraudDetector
+from ml_models.fraud_detection.graph_fraud_detector import GraphFraudRingDetector
 from app.constants import FraudSeverity, AlertStatus
 from app.config import settings
 
@@ -35,6 +36,10 @@ class FraudDetectionAgent:
             n_estimators=200,
         )
         self.dbscan_detector = DBSCANFraudDetector(eps=0.3, min_samples=5)
+        self.graph_ring_detector = GraphFraudRingDetector(
+            min_ring_size=3,
+            min_edge_weight=1,
+        )
         self.trained = False
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -53,15 +58,20 @@ class FraudDetectionAgent:
         seen = set()
         deduped = []
         for alert in alerts:
-            # Dedup key: highest-confidence alert per card or transaction
-            key_parts = []
-            if "card_id" in alert:
-                key_parts.append(f"card:{alert['card_id']}")
-            if "fps_shop_id" in alert:
-                key_parts.append(f"shop:{alert['fps_shop_id']}")
-            if "pattern" in alert:
-                key_parts.append(f"pattern:{alert['pattern']}")
-            key = "|".join(key_parts)
+            # Graph ring alerts are unique per ring_id — never deduplicate them against
+            # each other or against DBSCAN cluster alerts.
+            if alert.get("model") == "graph_fraud_ring_detector":
+                ring_id = alert.get("ring_id", id(alert))
+                key = f"graph_ring:{ring_id}"
+            else:
+                key_parts = []
+                if "card_id" in alert:
+                    key_parts.append(f"card:{alert['card_id']}")
+                if "fps_shop_id" in alert:
+                    key_parts.append(f"shop:{alert['fps_shop_id']}")
+                if "pattern" in alert:
+                    key_parts.append(f"pattern:{alert['pattern']}")
+                key = "|".join(key_parts)
 
             if key not in seen:
                 seen.add(key)
@@ -101,9 +111,9 @@ class FraudDetectionAgent:
         if not isinstance(txn_ids, list):
             txn_ids = []
 
-        return {
+        enriched: Dict = {
             "alert_id": str(uuid.uuid4()),
-            "beneficiary_card_id": raw_alert.get("card_id"),
+            "beneficiary_card_id": raw_alert.get("card_id"),  # None for ring-level alerts
             "fps_shop_id": str(raw_alert["fps_shop_id"]) if raw_alert.get("fps_shop_id") else None,
             "transaction_ids": txn_ids,
             "severity": severity,
@@ -116,6 +126,14 @@ class FraudDetectionAgent:
             "model": raw_alert.get("model", "ensemble"),
             "detected_at": datetime.utcnow().isoformat(),
         }
+
+        # Preserve graph-ring-specific fields so RAG indexing and API consumers
+        # can access the full ring membership data
+        if raw_alert.get("model") == "graph_fraud_ring_detector":
+            enriched["ring_id"] = raw_alert.get("ring_id")
+            enriched["ring_metadata"] = raw_alert.get("ring_metadata", {})
+
+        return enriched
 
     # ── Main Detection Run ────────────────────────────────────────────────────
 
@@ -161,6 +179,12 @@ class FraudDetectionAgent:
             all_raw_alerts.extend(cluster_alerts)
             logger.info(f"DBSCAN clusters: {len(cluster_alerts)} alerts")
 
+        # 4. Graph Fraud Ring Detector (bipartite card-shop graph + community detection)
+        if len(transactions_df) >= 5:
+            _, ring_alerts = self.graph_ring_detector.detect_rings(transactions_df)
+            all_raw_alerts.extend(ring_alerts)
+            logger.info(f"Graph ring detector: {len(ring_alerts)} ring alerts")
+
         # Enrich + deduplicate
         enriched = [self._enrich_alert(a) for a in all_raw_alerts]
         enriched = self._deduplicate_alerts(enriched)
@@ -171,10 +195,13 @@ class FraudDetectionAgent:
         medium = [a for a in enriched if a["severity"] == FraudSeverity.MEDIUM.value]
         low = [a for a in enriched if a["severity"] == FraudSeverity.LOW.value]
 
+        ring_alerts_enriched = [a for a in enriched if a.get("model") == "graph_fraud_ring_detector"]
+
         logger.info(
             f"Fraud Detection Agent complete: {len(enriched)} alerts "
             f"(Critical: {len(critical)}, High: {len(high)}, "
-            f"Medium: {len(medium)}, Low: {len(low)})"
+            f"Medium: {len(medium)}, Low: {len(low)}, "
+            f"Rings: {len(ring_alerts_enriched)})"
         )
 
         return {
@@ -187,8 +214,11 @@ class FraudDetectionAgent:
                 "medium": len(medium),
                 "low": len(low),
                 "transactions_analysed": len(transactions_df),
+                "fraud_rings_detected": len(ring_alerts_enriched),
             },
             "critical_alerts": critical,        # Sent directly to Orchestrator
+            "fraud_rings": self.graph_ring_detector.ring_report,
+            "graph_summary": self.graph_ring_detector.get_graph_summary(),
             "generated_at": datetime.utcnow().isoformat(),
         }
 
