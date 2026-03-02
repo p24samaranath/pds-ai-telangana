@@ -20,6 +20,7 @@ from routes.fraud_alerts import router as fraud_router
 from routes.geospatial import router as geo_router
 from routes.dashboard import router as dashboard_router
 from routes.data import router as data_router
+from routes.simulation import router as simulation_router
 from app.config import settings
 
 # Ensure logs directory exists
@@ -76,6 +77,7 @@ app.include_router(forecasts_router)
 app.include_router(fraud_router)
 app.include_router(geo_router)
 app.include_router(dashboard_router)
+app.include_router(simulation_router)
 
 if __name__ == "__main__":
     import uvicorn

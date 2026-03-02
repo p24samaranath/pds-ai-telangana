@@ -1,6 +1,8 @@
 import axios from 'axios';
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// In production: use VITE_API_URL env var (GitHub Pages → Render).
+// In development: use '' (empty) so Vite proxies /api/* → localhost:8000.
+const BASE_URL = import.meta.env.VITE_API_URL || '';
 
 const api = axios.create({
   baseURL: BASE_URL,
@@ -96,6 +98,20 @@ export const getDataJobStatus = () =>
 
 export const getVisualizationData = () =>
   api.get('/api/v1/data/visualize').then(r => r.data);
+
+// ── SCM Simulation ─────────────────────────────────────────────────────────
+
+export const runSimulation = (config) =>
+  api.post('/api/v1/simulation/run', config).then(r => r.data);
+
+export const getSimulationPresets = () =>
+  api.get('/api/v1/simulation/presets').then(r => r.data);
+
+export const compareSimulationPolicies = (config) =>
+  api.post('/api/v1/simulation/compare', config).then(r => r.data);
+
+export const getDistrictMeta = () =>
+  api.get('/api/v1/simulation/district-meta').then(r => r.data);
 
 // ── Health & System ────────────────────────────────────────────────────────
 

@@ -14,15 +14,17 @@ import ForecastsPage  from './pages/ForecastsPage';
 import GeoMapPage     from './pages/GeoMapPage';
 import NLQueryPage    from './pages/NLQueryPage';
 import DataVizPage    from './pages/DataVizPage';
+import SimulationPage from './pages/SimulationPage';
 import { getHealth, triggerShutdown } from './services/api';
 
 const NAV_ITEMS = [
-  { path: '/viz',      label: 'Data Overview',  icon: '📊' },
-  { path: '/',         label: 'Dashboard',      icon: '🏠' },
-  { path: '/fraud',    label: 'Fraud Alerts',   icon: '🚨' },
-  { path: '/forecasts',label: 'Forecasts',      icon: '📈' },
-  { path: '/map',      label: 'Geo Map',        icon: '🗺️'  },
-  { path: '/query',    label: 'AI Query',       icon: '🤖' },
+  { path: '/viz',        label: 'Data Overview',  icon: '📊' },
+  { path: '/',           label: 'Dashboard',      icon: '🏠' },
+  { path: '/fraud',      label: 'Fraud Alerts',   icon: '🚨' },
+  { path: '/forecasts',  label: 'Forecasts',      icon: '📈' },
+  { path: '/map',        label: 'Geo Map',        icon: '🗺️'  },
+  { path: '/simulation', label: 'SCM Simulation', icon: '⚙️' },
+  { path: '/query',      label: 'AI Query',       icon: '🤖' },
 ];
 
 // ── Boot screen shown while backend is starting ────────────────────────────
@@ -182,12 +184,13 @@ function Shell() {
       {/* Main content */}
       <main className="main-content">
         <Routes>
-          <Route path="/viz"       element={<DataVizPage />} />
-          <Route path="/"          element={<Dashboard />} />
-          <Route path="/fraud"     element={<FraudAlertsPage />} />
-          <Route path="/forecasts" element={<ForecastsPage />} />
-          <Route path="/map"       element={<GeoMapPage />} />
-          <Route path="/query"     element={<NLQueryPage />} />
+          <Route path="/viz"        element={<DataVizPage />} />
+          <Route path="/"           element={<Dashboard />} />
+          <Route path="/fraud"      element={<FraudAlertsPage />} />
+          <Route path="/forecasts"  element={<ForecastsPage />} />
+          <Route path="/map"        element={<GeoMapPage />} />
+          <Route path="/simulation" element={<SimulationPage />} />
+          <Route path="/query"      element={<NLQueryPage />} />
         </Routes>
       </main>
 
