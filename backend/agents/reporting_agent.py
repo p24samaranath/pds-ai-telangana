@@ -124,40 +124,66 @@ class ReportingAgent:
                     f"Anthropic Claude call failed ({e}); trying Gemini fallback…"
                 )
 
-        # 2. Google Gemini (google-genai SDK)
+        # 2. Google Gemini (google-genai SDK) — tries multiple models on rate-limit
         if self.gemini_client:
-            try:
-                from google.genai import types as genai_types
+            from google.genai import types as genai_types
 
-                # Build a flat contents list for the new SDK.
-                # Convert role "assistant" → "model" as Gemini requires.
-                # Prepend the system instruction into the first user turn.
-                contents = []
-                for i, msg in enumerate(messages):
-                    role = "model" if msg["role"] == "assistant" else "user"
-                    text = msg["content"]
-                    # Inject system prompt before the first user message
-                    if i == 0 and msg["role"] == "user":
-                        text = f"{system_prompt}\n\n{text}"
-                    contents.append(
-                        genai_types.Content(
-                            role=role,
-                            parts=[genai_types.Part(text=text)],
-                        )
+            # Build contents list once (shared across model attempts)
+            contents = []
+            for i, msg in enumerate(messages):
+                role = "model" if msg["role"] == "assistant" else "user"
+                text = msg["content"]
+                if i == 0 and msg["role"] == "user":
+                    text = f"{system_prompt}\n\n{text}"
+                contents.append(
+                    genai_types.Content(
+                        role=role,
+                        parts=[genai_types.Part(text=text)],
                     )
+                )
 
-                response = self.gemini_client.models.generate_content(
-                    model=settings.GEMINI_MODEL,
-                    contents=contents,
-                    config=genai_types.GenerateContentConfig(
-                        max_output_tokens=max_tokens,
-                    ),
-                )
-                return response.text, "gemini"
-            except Exception as e:
-                logger.warning(
-                    f"Google Gemini call failed ({e}); falling back to rule-based response"
-                )
+            # Try primary model first, then free-tier-friendly fallbacks.
+            # gemma-3-4b-it and gemma-3-1b-it are open models with generous quota.
+            gemini_models = [
+                settings.GEMINI_MODEL,         # gemini-2.0-flash (primary)
+                "gemini-2.0-flash-lite",        # same generation, lighter quota
+                "gemma-3-4b-it",                # open model — high free-tier quota
+                "gemma-3-1b-it",                # smallest open model fallback
+            ]
+            for model_name in gemini_models:
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=genai_types.GenerateContentConfig(
+                            max_output_tokens=max_tokens,
+                        ),
+                    )
+                    text = response.text
+                    if not text:
+                        # Some models return empty text on safety blocks — try next
+                        logger.warning(f"Gemini model {model_name} returned empty text; trying next…")
+                        continue
+                    if model_name != settings.GEMINI_MODEL:
+                        logger.info(f"Gemini fallback model used: {model_name}")
+                    return text, "gemini"
+                except Exception as e:
+                    err_str = str(e)
+                    retriable = (
+                        "429" in err_str
+                        or "RESOURCE_EXHAUSTED" in err_str
+                        or "quota" in err_str.lower()
+                        or "404" in err_str
+                        or "NOT_FOUND" in err_str
+                    )
+                    if retriable:
+                        logger.warning(
+                            f"Gemini model {model_name} unavailable "
+                            f"({err_str[:120]}); trying next model…"
+                        )
+                        continue
+                    logger.warning(f"Google Gemini call failed ({e}); falling back to rule-based response")
+                    break
 
         # 3. Rule-based fallback (always succeeds)
         return None, "fallback"
@@ -397,11 +423,13 @@ GEOSPATIAL:
 
         if llm_used == "fallback" or answer is None:
             logger.info(f"answer_nl_query [{session_id}]: using rule-based fallback")
+            # Build a clean context-only response — don't expose internal error messages
             answer = (
-                f"Query received: '{query}'.\n\n"
-                f"No LLM API key is configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY). "
-                f"Here is the raw retrieved context that would have been used to answer:\n\n"
-                f"{retrieved_context}"
+                f"Here is what the PDS knowledge base contains for your query "
+                f"'{query}':\n\n"
+                f"{retrieved_context}\n\n"
+                f"(Note: AI-generated summary unavailable — LLM quota/credits exhausted. "
+                f"Raw context shown above.)"
             )
             llm_used = "fallback"
         else:

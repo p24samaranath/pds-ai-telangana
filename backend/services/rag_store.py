@@ -120,7 +120,7 @@ class RAGStore:
         """
         self.reset()
 
-        self._index_fraud(fraud_results)
+        self._index_fraud(fraud_results, shops_df=shops_df)
         self._index_forecasts(forecast_results)
         self._index_geo(geo_results)
         if shops_df is not None and not shops_df.empty:
@@ -131,7 +131,17 @@ class RAGStore:
         self.build_index()
         return len(self._docs)
 
-    def _index_fraud(self, fraud_results: Dict[str, Any]) -> None:
+    def _index_fraud(self, fraud_results: Dict[str, Any], shops_df=None) -> None:
+        # Build shop_id → district lookup from shops_df so alerts can include district
+        shop_district: Dict[str, str] = {}
+        if shops_df is not None and not shops_df.empty:
+            try:
+                if "shop_id" in shops_df.columns and "district" in shops_df.columns:
+                    shop_district = dict(
+                        zip(shops_df["shop_id"].astype(str), shops_df["district"].astype(str))
+                    )
+            except Exception:
+                pass
         summary = fraud_results.get("summary", {})
         # Summary chunk
         self.add_document(RAGDocument(
@@ -149,20 +159,89 @@ class RAGStore:
             metadata=summary,
         ))
 
-        # Individual critical/high alerts — each as its own chunk
-        for alert in fraud_results.get("alerts", []):
-            severity = alert.get("severity", "")
-            if severity not in ("Critical", "High"):
+        all_alerts = fraud_results.get("alerts", [])
+
+        # --- District-level fraud summary (answers "which districts have most fraud?") ---
+        from collections import Counter
+        district_counts: Counter = Counter()
+        district_patterns: Dict[str, Counter] = {}
+        for alert in all_alerts:
+            # Prefer district on the alert; fall back to shop_district lookup
+            district = (
+                alert.get("district")
+                or shop_district.get(str(alert.get("fps_shop_id", "")))
+                or "Unknown"
+            )
+            if district == "Unknown":
                 continue
+            district_counts[district] += 1
+            district_patterns.setdefault(district, Counter())[
+                alert.get("fraud_pattern", "other")
+            ] += 1
+
+        if district_counts:
+            top_districts_text = "; ".join(
+                f"{d}: {c} alerts" for d, c in district_counts.most_common(10)
+            )
+            self.add_document(RAGDocument(
+                doc_id="fraud_by_district",
+                text=(
+                    f"Fraud alerts by district (top 10): {top_districts_text}. "
+                    f"Total districts affected: {len(district_counts)}."
+                ),
+                source="fraud_by_district",
+                metadata={"district_counts": dict(district_counts.most_common(15))},
+            ))
+            # One chunk per district for fine-grained retrieval
+            for district, count in district_counts.most_common(20):
+                top_patterns = district_patterns[district].most_common(3)
+                pattern_text = ", ".join(f"{p}: {c}" for p, c in top_patterns)
+                self.add_document(RAGDocument(
+                    doc_id=f"fraud_district_{district}",
+                    text=(
+                        f"District {district}: {count} fraud alerts. "
+                        f"Top fraud patterns: {pattern_text or 'various'}."
+                    ),
+                    source="fraud_by_district",
+                    metadata={"district": district, "alert_count": count},
+                ))
+
+        # --- Pattern-level fraud summary ---
+        pattern_counts: Counter = Counter()
+        for alert in all_alerts:
+            pattern_counts[alert.get("fraud_pattern", "other")] += 1
+        if pattern_counts:
+            pattern_text = "; ".join(
+                f"{p}: {c}" for p, c in pattern_counts.most_common(8)
+            )
+            self.add_document(RAGDocument(
+                doc_id="fraud_by_pattern",
+                text=f"Fraud alerts by pattern: {pattern_text}.",
+                source="fraud_by_pattern",
+                metadata={"pattern_counts": dict(pattern_counts)},
+            ))
+
+        # --- Individual alerts: cap to top 50 by anomaly_score to avoid RAG bloat ---
+        # (17k identical-looking chunks overwhelm TF-IDF — top-50 covers the worst cases)
+        high_alerts = [a for a in all_alerts if a.get("severity") in ("Critical", "High")]
+        high_alerts.sort(key=lambda a: a.get("anomaly_score", 0), reverse=True)
+        for alert in high_alerts[:50]:
+            severity = alert.get("severity", "")
             shop = alert.get("fps_shop_id", "unknown shop")
             card = alert.get("beneficiary_card_id", "unknown card")
             pattern = alert.get("fraud_pattern", "unknown pattern")
             score = alert.get("anomaly_score", 0)
             explanation = alert.get("explanation", "")
+            district = (
+                alert.get("district")
+                or shop_district.get(str(alert.get("fps_shop_id", "")))
+                or ""
+            )
+            district_text = f" in district {district}" if district else ""
             self.add_document(RAGDocument(
                 doc_id=f"fraud_alert_{alert.get('alert_id', id(alert))}",
                 text=(
-                    f"Fraud alert ({severity}): shop {shop}, card {card}, "
+                    f"Fraud alert ({severity}): shop {shop}{district_text}, card {card}, "
                     f"pattern '{pattern}', anomaly score {score:.2f}. "
                     f"Explanation: {explanation}"
                 ),
@@ -170,6 +249,7 @@ class RAGStore:
                 metadata={
                     "severity": severity,
                     "fps_shop_id": shop,
+                    "district": district,
                     "card_id": card,
                     "pattern": pattern,
                     "score": score,
@@ -200,6 +280,26 @@ class RAGStore:
             ))
 
     def _index_forecasts(self, forecast_results: Dict[str, Any]) -> None:
+        # Commodity-level demand summary
+        forecasts = forecast_results.get("forecasts", [])
+        if forecasts:
+            from collections import defaultdict
+            commodity_totals: dict = defaultdict(float)
+            for f in forecasts:
+                commodity_totals[f.get("commodity", "unknown")] += f.get("forecast_qty_kg", 0)
+            commodity_text = "; ".join(
+                f"{c}: {v:,.0f} kg" for c, v in sorted(commodity_totals.items(), key=lambda x: -x[1])
+            )
+            self.add_document(RAGDocument(
+                doc_id="forecast_commodity_summary",
+                text=(
+                    f"Demand forecast by commodity: {commodity_text}. "
+                    f"Total forecasts generated: {len(forecasts)}."
+                ),
+                source="forecast_summary",
+                metadata={"commodity_totals": dict(commodity_totals)},
+            ))
+
         self.add_document(RAGDocument(
             doc_id="forecast_summary",
             text=(
