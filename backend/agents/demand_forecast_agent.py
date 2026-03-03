@@ -11,6 +11,7 @@ import logging
 
 from ml_models.demand_forecast.lstm_model import LSTMForecaster
 from ml_models.demand_forecast.prophet_model import ProphetForecaster, EnsembleForecaster
+from ml_models.demand_forecast.entitlement_model import EntitlementDemandModel
 from app.constants import CommodityType
 from app.config import settings
 
@@ -28,7 +29,8 @@ class DemandForecastAgent:
     def __init__(self):
         self.lstm_forecasters: Dict[str, LSTMForecaster] = {}
         self.prophet_forecasters: Dict[str, ProphetForecaster] = {}
-        self.ensemble = EnsembleForecaster(lstm_weight=0.5, prophet_weight=0.5)
+        self.ensemble = EnsembleForecaster(lstm_weight=0.4, prophet_weight=0.6)
+        self.entitlement_model = EntitlementDemandModel()
         self.last_mape: Dict[str, float] = {}
         self.retrain_threshold = settings.MODEL_RETRAIN_THRESHOLD_MAPE
 
@@ -226,20 +228,37 @@ class DemandForecastAgent:
         transactions_df: pd.DataFrame,
         commodities: Optional[List[CommodityType]] = None,
         months_ahead: int = 3,
+        beneficiaries_df: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
-        """Run demand forecasting for all shops and commodities."""
+        """
+        Run demand forecasting for all shops and commodities.
+
+        Produces two parallel outputs:
+          1. Prophet/LSTM time-series forecasts (historical trend-based)
+          2. Entitlement-physics forecasts (from AAY/PHH card counts)
+          3. Supply gap analysis: actual vs entitlement
+
+        Args:
+            shops           : List of shop dicts (from shops_df.to_dict("records"))
+            transactions_df : Normalised long-format transactions
+            commodities     : Commodities to forecast (default: RICE, WHEAT)
+            months_ahead    : Number of months to forecast
+            beneficiaries_df: Optional — provides AAY/PHH card counts for
+                              accurate entitlement model; falls back to 10/90 split
+        """
         if commodities is None:
             commodities = [CommodityType.RICE, CommodityType.WHEAT]
 
         all_forecasts = []
-        risk_flags = []
-        errors = []
+        risk_flags    = []
+        errors        = []
 
+        # ── Time-series forecasts (Prophet/LSTM) ─────────────────────────────
         for shop in shops:
             for commodity in commodities:
                 try:
                     result = await self.forecast_shop(
-                        shop_id=str(shop["shop_id"]),
+                        shop_id=str(shop.get("shop_id", shop.get("fps_shop_id", ""))),
                         shop_name=shop.get("shop_name", "Unknown"),
                         district=shop.get("district", "Unknown"),
                         transactions_df=transactions_df,
@@ -247,7 +266,6 @@ class DemandForecastAgent:
                         months_ahead=months_ahead,
                     )
                     all_forecasts.extend(result.get("forecasts", []))
-
                     for f in result.get("forecasts", []):
                         if f.get("risk_flag"):
                             risk_flags.append(f)
@@ -255,19 +273,82 @@ class DemandForecastAgent:
                     logger.error(f"Forecast error for shop {shop.get('shop_id')}: {e}")
                     errors.append({"shop_id": shop.get("shop_id"), "error": str(e)})
 
+        # ── Entitlement supply gap analysis ──────────────────────────────────
+        supply_gap_results = {}
+        district_supply_summary = []
+        try:
+            # Build a shop-level aggregate from transactions_df
+            shops_df_tmp = pd.DataFrame(shops)
+            if "shop_id" in shops_df_tmp.columns and "fps_shop_id" not in shops_df_tmp.columns:
+                shops_df_tmp = shops_df_tmp.rename(columns={"shop_id": "fps_shop_id"})
+
+            # Aggregate rice totals per shop from transactions
+            rice_txns = transactions_df[transactions_df["commodity"] == "rice"] if not transactions_df.empty else pd.DataFrame()
+            if not rice_txns.empty and "fps_shop_id" in rice_txns.columns:
+                rice_agg = (
+                    rice_txns.groupby("fps_shop_id")["quantity_kg"]
+                    .sum()
+                    .rename("rice_total_kg")
+                    .reset_index()
+                )
+                if "fps_shop_id" in shops_df_tmp.columns:
+                    shop_for_gap = shops_df_tmp.merge(rice_agg, on="fps_shop_id", how="left")
+                    shop_for_gap["rice_total_kg"] = shop_for_gap["rice_total_kg"].fillna(0)
+                    if "total_cards" not in shop_for_gap.columns:
+                        shop_for_gap["total_cards"] = 100  # fallback
+                    shop_for_gap["fps_shop_id"] = shop_for_gap["fps_shop_id"].astype(str)
+
+                    gap_df = self.entitlement_model.compute_supply_gap(
+                        shop_df=shop_for_gap,
+                        beneficiaries_df=beneficiaries_df,
+                    )
+
+                    under_supplied = gap_df[gap_df.get("supply_status", pd.Series()) == "under_supplied"]
+                    over_supplied  = gap_df[gap_df.get("supply_status", pd.Series()) == "over_supplied"]
+
+                    supply_gap_results = {
+                        "n_shops_analysed":        len(gap_df),
+                        "n_under_supplied":        int(len(under_supplied)),
+                        "n_over_supplied":         int(len(over_supplied)),
+                        "n_critically_under":      int((gap_df.get("supply_status", pd.Series()) == "critically_under_supplied").sum()),
+                        "total_expected_rice_kg":  round(float(gap_df["expected_rice_kg"].sum()), 1) if "expected_rice_kg" in gap_df.columns else 0,
+                        "total_actual_rice_kg":    round(float(gap_df["rice_total_kg"].sum()), 1) if "rice_total_kg" in gap_df.columns else 0,
+                        "over_supplied_shop_ids":  over_supplied["fps_shop_id"].tolist()[:20] if "fps_shop_id" in over_supplied.columns else [],
+                    }
+
+                    district_df = self.entitlement_model.district_supply_summary(gap_df)
+                    district_supply_summary = district_df.to_dict("records") if not district_df.empty else []
+
+                    # Flag over-supplied shops as demand risk flags
+                    for _, row in over_supplied.iterrows():
+                        risk_flags.append({
+                            "fps_shop_id": str(row.get("fps_shop_id", "")),
+                            "district":    str(row.get("district", "")),
+                            "risk_flag":   "over_supplied",
+                            "rice_gap_pct": float(row.get("rice_gap_pct", 0)),
+                            "model_used":  "entitlement_physics",
+                        })
+
+        except Exception as e:
+            logger.error(f"Entitlement supply gap analysis failed: {e}")
+            supply_gap_results = {"error": str(e)}
+
         logger.info(
-            f"Demand Forecast Agent complete: {len(all_forecasts)} forecasts, "
-            f"{len(risk_flags)} risk flags, {len(errors)} errors"
+            f"Demand Forecast Agent complete: {len(all_forecasts)} ts-forecasts, "
+            f"{len(risk_flags)} risk flags, {len(errors)} errors, "
+            f"supply_gap shops: {supply_gap_results.get('n_shops_analysed', 0)}"
         )
 
         return {
-            "agent": "demand_forecast",
-            "forecasts": all_forecasts,
-            "risk_flags": risk_flags,
-            "total_forecasts": len(all_forecasts),
-            "total_risk_flags": len(risk_flags),
-            "errors": errors,
-            "generated_at": datetime.utcnow().isoformat(),
+            "agent":                  "demand_forecast",
+            "forecasts":              all_forecasts,
+            "risk_flags":             risk_flags,
+            "total_forecasts":        len(all_forecasts),
+            "total_risk_flags":       len(risk_flags),
+            "errors":                 errors,
+            "supply_gap":             supply_gap_results,
+            "district_supply_summary": district_supply_summary,
+            "generated_at":           datetime.utcnow().isoformat(),
         }
 
     def update_mape(self, shop_id: str, commodity: str,

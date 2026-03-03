@@ -12,6 +12,7 @@ from agents.orchestrator_agent import OrchestratorAgent, WorkflowTrigger
 from agents.reporting_agent import ReportingAgent
 from agents.fraud_detection_agent import FraudDetectionAgent
 from agents.demand_forecast_agent import DemandForecastAgent
+from agents.scoring_agent import ScoringAgent
 from app.constants import CommodityType
 from database.schemas import (
     AgentQueryRequest, AgentQueryResponse, OrchestratorStatus,
@@ -26,6 +27,7 @@ _orchestrator: Optional[OrchestratorAgent] = None
 _reporting_agent: Optional[ReportingAgent] = None
 _fraud_agent: Optional[FraudDetectionAgent] = None
 _forecast_agent: Optional[DemandForecastAgent] = None
+_scoring_agent: Optional[ScoringAgent] = None
 _data_service: DataIngestionService = DataIngestionService()
 
 # Cached pipeline results — updated each time the pipeline runs so /chat can
@@ -63,6 +65,13 @@ def get_forecast_agent() -> DemandForecastAgent:
     if _forecast_agent is None:
         _forecast_agent = DemandForecastAgent()
     return _forecast_agent
+
+
+def get_scoring_agent() -> ScoringAgent:
+    global _scoring_agent
+    if _scoring_agent is None:
+        _scoring_agent = ScoringAgent()
+    return _scoring_agent
 
 
 @router.get("/status", response_model=OrchestratorStatus)
@@ -253,4 +262,112 @@ async def rag_store_stats():
         "rag_store_fitted": reporting.rag_store.is_fitted,
         "last_indexed_at": reporting._last_indexed_at,
         "active_sessions": len(reporting.list_sessions()),
+    }
+
+
+# ── Scoring Endpoints ─────────────────────────────────────────────────────────
+
+@router.get("/scores/shops")
+async def get_shop_scores(
+    district: Optional[str] = None,
+    band: Optional[str] = None,
+    top_n: Optional[int] = None,
+    bottom_n: Optional[int] = None,
+):
+    """
+    Shop performance scores (0-100 composite).
+
+    Query params:
+      district : Filter by district name (case-insensitive)
+      band     : Filter by performance band (Exemplary/Good/Average/Below Average/Critical)
+      top_n    : Return only top N shops by score
+      bottom_n : Return only bottom N shops by score
+    """
+    scoring = get_scoring_agent()
+    shops_df, bene_df, txn_df = _data_service.get_all_data()
+
+    fraud_alerts = _last_pipeline_results.get("fraud_results", {}).get("alerts", [])
+    result = await scoring.run(
+        transactions_df=txn_df,
+        shops_df=shops_df,
+        beneficiaries_df=bene_df,
+        fraud_alerts=fraud_alerts,
+    )
+
+    scores = result["shop_scores"]
+
+    # Apply filters
+    if district:
+        scores = [s for s in scores if str(s.get("district", "")).lower() == district.lower()]
+    if band:
+        scores = [s for s in scores if s.get("performance_band", "").lower() == band.lower()]
+    if top_n:
+        scores = sorted(scores, key=lambda x: x.get("total_score", 0), reverse=True)[:top_n]
+    if bottom_n:
+        scores = sorted(scores, key=lambda x: x.get("total_score", 0))[:bottom_n]
+
+    return {
+        "shop_scores":    scores,
+        "total_shops":    len(scores),
+        "summary":        result["shop_summary"],
+        "generated_at":   result["generated_at"],
+    }
+
+
+@router.get("/scores/shops/{shop_id}")
+async def get_shop_score_detail(shop_id: str):
+    """Detailed performance score for a single FPS shop."""
+    scoring = get_scoring_agent()
+    shops_df, bene_df, txn_df = _data_service.get_all_data()
+
+    fraud_alerts = _last_pipeline_results.get("fraud_results", {}).get("alerts", [])
+    result = await scoring.run(
+        transactions_df=txn_df,
+        shops_df=shops_df,
+        beneficiaries_df=bene_df,
+        fraud_alerts=fraud_alerts,
+    )
+
+    matching = [
+        s for s in result["shop_scores"]
+        if str(s.get("fps_shop_id", "")) == str(shop_id)
+    ]
+    if not matching:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Shop '{shop_id}' not found")
+
+    return {
+        "shop":         matching[0],
+        "generated_at": result["generated_at"],
+    }
+
+
+@router.get("/scores/districts")
+async def get_district_scores(risk_level: Optional[str] = None):
+    """
+    District health index scores (0-100).
+
+    Query params:
+      risk_level : Filter by risk level (Critical/High/Moderate/Low)
+    """
+    scoring = get_scoring_agent()
+    shops_df, bene_df, txn_df = _data_service.get_all_data()
+
+    fraud_alerts = _last_pipeline_results.get("fraud_results", {}).get("alerts", [])
+    result = await scoring.run(
+        transactions_df=txn_df,
+        shops_df=shops_df,
+        beneficiaries_df=bene_df,
+        fraud_alerts=fraud_alerts,
+    )
+
+    districts = result["district_scores"]
+    if risk_level:
+        districts = [d for d in districts if d.get("risk_level", "").lower() == risk_level.lower()]
+
+    return {
+        "district_scores":  districts,
+        "total_districts":  len(districts),
+        "summary":          result["district_summary"],
+        "generated_at":     result["generated_at"],
     }

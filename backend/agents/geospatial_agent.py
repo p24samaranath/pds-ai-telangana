@@ -101,30 +101,60 @@ class GeospatialAgent:
                 beneficiaries_df, shops_df
             )
 
+        # 6. Equity analysis — Gini coefficient of beneficiary load distribution
+        equity_index = self.optimizer.compute_equity_index(shops_df)
+
+        # 7. Shop vulnerability index — GPS isolation + supply gap + fraud risk
+        try:
+            vuln_df = self.optimizer.compute_shop_vulnerability(
+                shops_df=shops_df,
+                shop_features_df=None,   # supply gap not available here
+                fraud_alerts=None,
+            )
+            critical_vuln = vuln_df[vuln_df["vulnerability_band"] == "Critical"]
+            vulnerability_summary = {
+                "total_shops_assessed": len(vuln_df),
+                "critical": int((vuln_df["vulnerability_band"] == "Critical").sum()),
+                "high":     int((vuln_df["vulnerability_band"] == "High").sum()),
+                "moderate": int((vuln_df["vulnerability_band"] == "Moderate").sum()),
+                "low":      int((vuln_df["vulnerability_band"] == "Low").sum()),
+                "critical_shop_ids": (
+                    critical_vuln["fps_shop_id"].tolist()
+                    if "fps_shop_id" in critical_vuln.columns
+                    else critical_vuln.get("shop_id", pd.Series()).tolist()
+                )[:20],
+            }
+        except Exception as exc:
+            logger.warning(f"Vulnerability index failed: {exc}")
+            vulnerability_summary = {"error": str(exc)}
+
         # Summary statistics
         total_beneficiaries = len(beneficiaries_df)
         underserved_count = len(underserved_df)
-        pct_within_3km = round(
+        pct_within_threshold = round(
             (total_beneficiaries - underserved_count) / max(total_beneficiaries, 1) * 100, 1
         )
 
         logger.info(
             f"Geospatial Agent: {underserved_count} underserved beneficiaries, "
             f"{len(new_locations)} location recommendations, "
-            f"accessibility score: {accessibility_score:.2f}"
+            f"accessibility score: {accessibility_score:.2f}, "
+            f"load Gini: {equity_index.get('gini_coefficient', 'N/A')}"
         )
 
         return {
-            "agent": "geospatial",
-            "network_reanalysed": network_changed,
-            "overall_accessibility_score": round(accessibility_score, 3),
-            "pct_beneficiaries_within_threshold_km": pct_within_3km,
-            "underserved_count": underserved_count,
-            "total_beneficiaries": total_beneficiaries,
-            "underserved_zones": underserved_zones,
-            "new_location_recommendations": new_locations,
-            "voronoi_zones": voronoi,
-            "underperforming_shops": underperforming,
-            "district_accessibility_scores": district_scores,
-            "generated_at": datetime.utcnow().isoformat(),
+            "agent":                            "geospatial",
+            "network_reanalysed":               network_changed,
+            "overall_accessibility_score":      round(accessibility_score, 3),
+            "pct_beneficiaries_within_threshold_km": pct_within_threshold,
+            "underserved_count":                underserved_count,
+            "total_beneficiaries":              total_beneficiaries,
+            "underserved_zones":                underserved_zones,
+            "new_location_recommendations":     new_locations,
+            "voronoi_zones":                    voronoi,
+            "underperforming_shops":            underperforming,
+            "district_accessibility_scores":    district_scores,
+            "equity_analysis":                  equity_index,
+            "vulnerability_summary":            vulnerability_summary,
+            "generated_at":                     datetime.utcnow().isoformat(),
         }

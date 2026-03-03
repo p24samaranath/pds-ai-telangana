@@ -174,6 +174,7 @@ class OrchestratorAgent:
             transactions_df=transactions_df,
             commodities=[CommodityType.RICE, CommodityType.WHEAT],
             months_ahead=3,
+            beneficiaries_df=beneficiaries_df,
         )
         state["forecast_results"] = forecast_results
         self._memory["last_forecast_run"] = datetime.utcnow().isoformat()

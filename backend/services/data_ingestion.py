@@ -148,7 +148,8 @@ def _normalise_transactions(df: pd.DataFrame) -> pd.DataFrame:
     present = {col: comm for col, comm in commodity_map.items() if col in df.columns}
 
     if present:
-        keep_cols = ["fps_shop_id", "district", "transaction_date", "total_cards"]
+        keep_cols = ["fps_shop_id", "district", "transaction_date", "total_cards",
+                     "total_transactions", "total_units"]
         keep_cols = [c for c in keep_cols if c in df.columns]
         rows = []
         for col, commodity in present.items():

@@ -1,13 +1,23 @@
 """
 Rule-Based Fraud Detection Engine
-Deterministic rules for known PDS fraud patterns.
+==================================
+Deterministic rules operating on **shop-level aggregate features** derived from
+real Telangana PDS wide-format data.
+
+All previous rules based on per-transaction columns (biometric_verified,
+hour_of_day, card_id across shops) have been replaced with rules that work
+on real monthly aggregates: rice_per_card, collection_rate, wheat_per_card,
+kerosene_per_card, total_cards, etc.
+
+Each rule returns a list of alert dicts in the same schema expected by
+FraudDetectionAgent._enrich_alert().
 """
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Tuple
-from datetime import datetime, timedelta
 import logging
-from app.constants import FraudPattern, FraudSeverity
+from typing import Dict, List, Tuple
+
+import pandas as pd
+
+from app.constants import FraudSeverity
 
 logger = logging.getLogger(__name__)
 
@@ -15,179 +25,289 @@ logger = logging.getLogger(__name__)
 class RuleBasedFraudDetector:
     """
     Implements deterministic fraud rules for the PDS system.
-    Each rule returns a list of flagged transaction IDs with explanations.
+    Works on shop-level aggregate features (one row per shop per period).
     """
 
+    DEFAULT_CONFIG: Dict = {
+        "aay_rice_ceiling_kg":         35.0,   # AAY maximum rice per card
+        "phantom_txn_threshold":        1.05,   # collection_rate > 1.05 → impossible
+        "ghost_shop_rate":              0.05,   # collection_rate < 5% → near-zero dist.
+        "ghost_shop_min_cards":         100,    # minimum cards to flag ghost-shop rule
+        "low_collection_threshold":     0.40,   # < 40% collection rate → flag
+        "over_collection_percentile":   95,     # rice_per_card > district p95 → flag
+        "kerosene_spike_multiplier":    2.0,    # > 2× district p90 → flag
+        "non_wheat_district_threshold": 0.95,   # if >95% shops have 0 wheat → non-wheat
+    }
+
     def __init__(self, rules_config: Dict = None):
-        self.config = rules_config or {
-            "duplicate_window_hours": 24,
-            "bulk_transaction_threshold_pct": 0.40,   # >40% txns in last hour → flag
-            "min_biometric_rate": 0.80,                # <80% biometric → flag dealer
-            "operating_hours_start": 8,
-            "operating_hours_end": 20,
-            "max_daily_cards_per_dealer": 200,
-        }
+        self.config = {**self.DEFAULT_CONFIG, **(rules_config or {})}
 
-    # ── Rule 1: Duplicate Transactions ────────────────────────────────────────
+    # ── Rule 1: Phantom Transactions ──────────────────────────────────────────
 
-    def detect_duplicate_transactions(self, df: pd.DataFrame) -> List[Dict]:
-        """Flag same card used at ≥2 different shops in same month."""
+    def detect_phantom_transactions(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops whose collection_rate exceeds 1.05 (more txns than cards)."""
+        if "collection_rate" not in df.columns:
+            return []
+
+        thresh = self.config["phantom_txn_threshold"]
         alerts = []
-        df["month_key"] = pd.to_datetime(df["transaction_date"]).dt.to_period("M")
-
-        grouped = df.groupby(["card_id", "month_key"])["fps_shop_id"].nunique()
-        duplicates = grouped[grouped > 1].reset_index()
-
-        for _, row in duplicates.iterrows():
-            txn_mask = (
-                (df["card_id"] == row["card_id"])
-                & (df["month_key"] == row["month_key"])
-            )
-            flagged_txns = df[txn_mask]["transaction_id"].tolist()
+        for _, row in df[df["collection_rate"] > thresh].iterrows():
+            cr = float(row["collection_rate"])
             alerts.append({
-                "pattern": FraudPattern.DUPLICATE_TRANSACTION,
-                "severity": FraudSeverity.HIGH,
-                "card_id": row["card_id"],
-                "transaction_ids": flagged_txns,
-                "anomaly_score": 0.85,
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "phantom_transactions",
+                "severity":    FraudSeverity.CRITICAL,
+                "anomaly_score": min(1.0, 0.90 + (cr - thresh) * 0.50),
                 "explanation": (
-                    f"Card {row['card_id']} used at {row['fps_shop_id']} different FPS shops "
-                    f"in {row['month_key']}. This indicates either a duplicate card or "
-                    f"a dealer-level record manipulation."
+                    f"Shop {row['fps_shop_id']} recorded {cr:.2f}× more transactions "
+                    f"than registered cards — physically impossible. Classic phantom "
+                    f"beneficiary fraud."
                 ),
-                "recommended_action": "Block card; trigger field verification",
+                "recommended_action": "Immediate suspension; forensic audit of ePoS device",
             })
         return alerts
 
-    # ── Rule 2: Outside Operating Hours ───────────────────────────────────────
+    # ── Rule 2: Entitlement Breach ────────────────────────────────────────────
 
-    def detect_after_hours_transactions(self, df: pd.DataFrame) -> List[Dict]:
-        """Flag transactions logged outside official FPS operating hours."""
+    def detect_entitlement_breach(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops distributing rice above the AAY ceiling (35 kg/card)."""
+        if "rice_per_card" not in df.columns:
+            return []
+
+        ceiling = self.config["aay_rice_ceiling_kg"]
         alerts = []
-        df["hour"] = pd.to_datetime(df["transaction_date"]).dt.hour
-        start = self.config["operating_hours_start"]
-        end = self.config["operating_hours_end"]
+        for _, row in df[df["rice_per_card"] > ceiling].iterrows():
+            rpc = float(row["rice_per_card"])
+            pct_over = (rpc - ceiling) / ceiling
+            alerts.append({
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "entitlement_breach",
+                "severity":    FraudSeverity.CRITICAL,
+                "anomaly_score": min(1.0, 0.85 + pct_over * 0.15),
+                "explanation": (
+                    f"Shop {row['fps_shop_id']} distributed {rpc:.1f} kg rice/card, "
+                    f"exceeding the AAY entitlement ceiling of {ceiling:.0f} kg "
+                    f"({pct_over:.0%} over limit). Indicates inflated records or "
+                    f"grain diversion."
+                ),
+                "recommended_action": "Cross-verify with state warehouse dispatch records",
+            })
+        return alerts
 
-        after_hours = df[(df["hour"] < start) | (df["hour"] >= end)]
-        for fps_id, group in after_hours.groupby("fps_shop_id"):
-            if len(group) >= 5:
+    # ── Rule 3: Ghost Distribution ────────────────────────────────────────────
+
+    def detect_ghost_shops(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag large shops with near-zero collection rates."""
+        if "collection_rate" not in df.columns or "total_cards" not in df.columns:
+            return []
+
+        ghost_rate = self.config["ghost_shop_rate"]
+        min_cards  = self.config["ghost_shop_min_cards"]
+        mask = (df["collection_rate"] < ghost_rate) & (df["total_cards"] >= min_cards)
+        alerts = []
+        for _, row in df[mask].iterrows():
+            cr    = float(row["collection_rate"])
+            cards = int(row.get("total_cards", 0))
+            alerts.append({
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "ghost_distribution",
+                "severity":    FraudSeverity.HIGH,
+                "anomaly_score": 0.80,
+                "explanation": (
+                    f"Shop {row['fps_shop_id']} served only {cr:.1%} of {cards} "
+                    f"registered cards. Near-zero distribution for a large shop "
+                    f"suggests it is non-operational while claiming stock."
+                ),
+                "recommended_action": "Field verification within 48 h; check physical operations",
+            })
+        return alerts
+
+    # ── Rule 4: Over-Collection (district p95) ────────────────────────────────
+
+    def detect_over_collection(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops with rice_per_card above district 95th percentile."""
+        if "rice_per_card" not in df.columns or "district" not in df.columns:
+            return []
+
+        ceiling = self.config["aay_rice_ceiling_kg"]
+        pct = self.config["over_collection_percentile"] / 100
+        alerts = []
+
+        for district, group in df.groupby("district"):
+            p95 = group["rice_per_card"].quantile(pct)
+            # Flag shops above p95 but below AAY ceiling (ceiling is handled by rule 2)
+            over = group[
+                (group["rice_per_card"] > p95) &
+                (group["rice_per_card"] <= ceiling)
+            ]
+            for _, row in over.iterrows():
+                rpc = float(row["rice_per_card"])
                 alerts.append({
-                    "pattern": FraudPattern.TEMPORAL_ANOMALY,
-                    "severity": FraudSeverity.MEDIUM,
-                    "fps_shop_id": fps_id,
-                    "transaction_ids": group["transaction_id"].tolist(),
-                    "anomaly_score": 0.65,
+                    "fps_shop_id": str(row["fps_shop_id"]),
+                    "district":    str(district),
+                    "pattern":     "above_district_p95",
+                    "severity":    FraudSeverity.HIGH,
+                    "anomaly_score": 0.72,
                     "explanation": (
-                        f"Shop {fps_id} logged {len(group)} transactions outside operating hours "
-                        f"({start}:00–{end}:00). This may indicate back-dated entries or "
-                        f"unauthorized system access."
+                        f"Shop {row['fps_shop_id']} distributed {rpc:.1f} kg rice/card, "
+                        f"exceeding the {district} district 95th percentile ({p95:.1f} kg). "
+                        f"Suggests over-claiming relative to district norms."
                     ),
-                    "recommended_action": "Suspend dealer; audit ePoS device logs",
+                    "recommended_action": "Cross-check beneficiary list; demand field audit",
                 })
         return alerts
 
-    # ── Rule 3: Month-End Bulk Transactions ───────────────────────────────────
+    # ── Rule 5: Low Collection Rate ───────────────────────────────────────────
 
-    def detect_month_end_bulk(self, df: pd.DataFrame) -> List[Dict]:
-        """Flag shops where >40% of monthly transactions occur in the last day."""
-        alerts = []
-        df["date"] = pd.to_datetime(df["transaction_date"]).dt.date
-        df["month_key"] = pd.to_datetime(df["transaction_date"]).dt.to_period("M")
+    def detect_low_collection(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops with collection rates below 40% (but not ghost-shop level)."""
+        if "collection_rate" not in df.columns:
+            return []
 
-        for (fps_id, month), group in df.groupby(["fps_shop_id", "month_key"]):
-            month_end = group["date"].max()
-            last_day = group[group["date"] == month_end]
-            ratio = len(last_day) / max(len(group), 1)
+        thresh      = self.config["low_collection_threshold"]
+        ghost_rate  = self.config["ghost_shop_rate"]
 
-            if ratio > self.config["bulk_transaction_threshold_pct"]:
-                alerts.append({
-                    "pattern": FraudPattern.TEMPORAL_ANOMALY,
-                    "severity": FraudSeverity.HIGH,
-                    "fps_shop_id": fps_id,
-                    "transaction_ids": last_day["transaction_id"].tolist(),
-                    "anomaly_score": 0.75,
-                    "explanation": (
-                        f"Shop {fps_id} processed {ratio:.0%} of its {month} transactions "
-                        f"on the final day ({month_end}). Typical month-end bulk data entry "
-                        f"strongly suggests ghost beneficiary transactions."
-                    ),
-                    "recommended_action": "Trigger field verification; cross-check biometric logs",
-                })
-        return alerts
-
-    # ── Rule 4: Low Biometric Rate ────────────────────────────────────────────
-
-    def detect_low_biometric_compliance(self, df: pd.DataFrame) -> List[Dict]:
-        """Flag dealers where biometric verification rate < threshold."""
-        alerts = []
-        if "biometric_verified" not in df.columns:
-            return alerts
-
-        dealer_bio = df.groupby("fps_shop_id").agg(
-            total=("transaction_id", "count"),
-            verified=("biometric_verified", "sum"),
+        # Minimum cards filter: ignore tiny shops with large statistical variance
+        min_cards = 50
+        cards_col = "total_cards" if "total_cards" in df.columns else None
+        mask = (
+            (df["collection_rate"] >= ghost_rate) &
+            (df["collection_rate"] < thresh)
         )
-        dealer_bio["bio_rate"] = dealer_bio["verified"] / dealer_bio["total"].clip(lower=1)
+        if cards_col:
+            mask = mask & (df[cards_col] >= min_cards)
 
-        low_bio = dealer_bio[
-            (dealer_bio["bio_rate"] < self.config["min_biometric_rate"])
-            & (dealer_bio["total"] >= 10)
-        ]
-
-        for fps_id, row in low_bio.iterrows():
+        alerts = []
+        for _, row in df[mask].iterrows():
+            cr = float(row["collection_rate"])
             alerts.append({
-                "pattern": FraudPattern.DEALER_SKIMMING,
-                "severity": FraudSeverity.CRITICAL if row["bio_rate"] < 0.5 else FraudSeverity.HIGH,
-                "fps_shop_id": fps_id,
-                "transaction_ids": [],
-                "anomaly_score": 1.0 - row["bio_rate"],
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "low_collection",
+                "severity":    FraudSeverity.MEDIUM,
+                "anomaly_score": round(0.55 + (thresh - cr) * 0.30, 3),
                 "explanation": (
-                    f"Shop {fps_id} has only {row['bio_rate']:.0%} biometric verification "
-                    f"across {int(row['total'])} transactions. This strongly indicates "
-                    f"dealer-level skimming — rations logged but not actually distributed."
+                    f"Shop {row['fps_shop_id']} collection rate is {cr:.0%} "
+                    f"(target: >{thresh:.0%}). Persistent low engagement may indicate "
+                    f"beneficiary exclusion, accessibility barriers, or an inactive shop."
                 ),
-                "recommended_action": "Suspend dealer license; initiate audit",
+                "recommended_action": "Beneficiary awareness campaign; verify accessibility",
             })
         return alerts
 
-    # ── Rule 5: Card Used at Too Many Shops ───────────────────────────────────
+    # ── Rule 6: Off-District Commodity ────────────────────────────────────────
 
-    def detect_card_multi_shop(self, df: pd.DataFrame,
-                               threshold: int = 2) -> List[Dict]:
-        """Flag cards that transact at more than `threshold` shops."""
+    def detect_commodity_anomaly(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops distributing wheat in districts where wheat is not allocated."""
+        if "wheat_per_card" not in df.columns or "district" not in df.columns:
+            return []
+
+        threshold = self.config["non_wheat_district_threshold"]
+        # Identify districts where the overwhelming majority of shops have 0 wheat
+        district_zero_rate = df.groupby("district")["wheat_per_card"].apply(
+            lambda x: (x == 0).mean()
+        )
+        non_wheat_districts = district_zero_rate[district_zero_rate > threshold].index
+
         alerts = []
-        card_shops = df.groupby("card_id")["fps_shop_id"].nunique()
-        suspicious = card_shops[card_shops > threshold]
-
-        for card_id, shop_count in suspicious.items():
-            txn_ids = df[df["card_id"] == card_id]["transaction_id"].tolist()
+        flagged = df[
+            df["district"].isin(non_wheat_districts) &
+            (df["wheat_per_card"] > 0)
+        ]
+        for _, row in flagged.iterrows():
+            wpc = float(row["wheat_per_card"])
             alerts.append({
-                "pattern": FraudPattern.GHOST_BENEFICIARY,
-                "severity": FraudSeverity.CRITICAL,
-                "card_id": card_id,
-                "transaction_ids": txn_ids,
-                "anomaly_score": min(1.0, (shop_count - threshold) * 0.25 + 0.70),
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "off_district_commodity",
+                "severity":    FraudSeverity.MEDIUM,
+                "anomaly_score": 0.60,
                 "explanation": (
-                    f"Card {card_id} has been used at {shop_count} different FPS shops. "
-                    f"Legitimate beneficiaries are assigned to a single shop. This suggests "
-                    f"a ghost beneficiary card being used across multiple locations."
+                    f"Shop {row['fps_shop_id']} distributed {wpc:.2f} kg wheat/card in "
+                    f"{row.get('district', 'a')} district where wheat is not allocated "
+                    f"(>95% of shops report zero wheat). Possible record manipulation."
                 ),
-                "recommended_action": "Block card immediately; notify district officer",
+                "recommended_action": "Verify commodity allocation list; check ePoS entries",
+            })
+        return alerts
+
+    # ── Rule 7: Kerosene Spike ────────────────────────────────────────────────
+
+    def detect_kerosene_spike(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag shops distributing kerosene at > 2× district 90th percentile."""
+        if "kerosene_per_card" not in df.columns or "district" not in df.columns:
+            return []
+
+        multiplier = self.config["kerosene_spike_multiplier"]
+        alerts = []
+
+        for district, group in df.groupby("district"):
+            p90 = group["kerosene_per_card"].quantile(0.90)
+            if p90 < 0.1:   # district barely distributes kerosene — skip
+                continue
+            threshold = p90 * multiplier
+            for _, row in group[group["kerosene_per_card"] > threshold].iterrows():
+                kpc = float(row["kerosene_per_card"])
+                ratio = kpc / p90
+                alerts.append({
+                    "fps_shop_id": str(row["fps_shop_id"]),
+                    "district":    str(district),
+                    "pattern":     "kerosene_spike",
+                    "severity":    FraudSeverity.MEDIUM,
+                    "anomaly_score": min(0.75, 0.55 + (ratio - multiplier) * 0.10),
+                    "explanation": (
+                        f"Shop {row['fps_shop_id']} distributed {kpc:.2f} L kerosene/card, "
+                        f"{ratio:.1f}× the {district} district 90th percentile ({p90:.2f} L). "
+                        f"Unusually high kerosene claims relative to district peers."
+                    ),
+                    "recommended_action": "Audit kerosene stock movement; verify beneficiary receipts",
+                })
+        return alerts
+
+    # ── Rule 8: No Distribution ───────────────────────────────────────────────
+
+    def detect_no_distribution(self, df: pd.DataFrame) -> List[Dict]:
+        """Flag active shops with zero rice distribution for the entire period."""
+        if "rice_total_kg" not in df.columns:
+            return []
+
+        alerts = []
+        zero_shops = df[df["rice_total_kg"] == 0]
+        for _, row in zero_shops.iterrows():
+            cards = int(row.get("total_cards", 0))
+            alerts.append({
+                "fps_shop_id": str(row["fps_shop_id"]),
+                "district":    str(row.get("district", "")),
+                "pattern":     "no_distribution",
+                "severity":    FraudSeverity.LOW,
+                "anomaly_score": 0.35,
+                "explanation": (
+                    f"Shop {row['fps_shop_id']} recorded zero rice distribution this "
+                    f"period for {cards} registered cards. Could indicate shop closure, "
+                    f"data entry failure, or deliberate omission."
+                ),
+                "recommended_action": "Verify shop operational status; follow up with mandal officer",
             })
         return alerts
 
     # ── Orchestrate all rules ─────────────────────────────────────────────────
 
     def run_all_rules(self, df: pd.DataFrame) -> Tuple[List[Dict], int]:
-        """Run all rules and return combined alerts + total count."""
-        all_alerts = []
-        all_alerts.extend(self.detect_duplicate_transactions(df))
-        all_alerts.extend(self.detect_after_hours_transactions(df))
-        all_alerts.extend(self.detect_month_end_bulk(df))
-        all_alerts.extend(self.detect_low_biometric_compliance(df))
-        all_alerts.extend(self.detect_card_multi_shop(df))
+        """Run all rules on shop-level aggregate data and return combined alerts."""
+        all_alerts: List[Dict] = []
+        all_alerts.extend(self.detect_phantom_transactions(df))
+        all_alerts.extend(self.detect_entitlement_breach(df))
+        all_alerts.extend(self.detect_ghost_shops(df))
+        all_alerts.extend(self.detect_over_collection(df))
+        all_alerts.extend(self.detect_low_collection(df))
+        all_alerts.extend(self.detect_commodity_anomaly(df))
+        all_alerts.extend(self.detect_kerosene_spike(df))
+        all_alerts.extend(self.detect_no_distribution(df))
 
         logger.info(
-            f"Rule engine produced {len(all_alerts)} alerts from {len(df)} transactions"
+            f"Rule engine: {len(all_alerts)} alerts from {len(df)} shops"
         )
         return all_alerts, len(all_alerts)
