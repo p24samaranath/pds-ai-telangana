@@ -148,7 +148,11 @@ class StatisticalFraudDetector:
                 group[_z] = 0.6745 * (vals - median) / (iqr + 1e-8)
                 return group
 
+            # Save district before groupby (pandas drops the groupby column)
+            district_backup = df[["fps_shop_id", "district"]].copy() if "district" in df.columns else None
             df = df.groupby("district", group_keys=False).apply(_z_for_group)
+            if "district" not in df.columns and district_backup is not None:
+                df = df.merge(district_backup, on="fps_shop_id", how="left")
 
         return df
 

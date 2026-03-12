@@ -150,7 +150,11 @@ class FraudDetectionAgent:
             group["district_rice_z"] = 0.6745 * (vals - median) / (iqr + 1e-8)
             return group
 
+        # Save district before groupby (pandas drops the groupby column)
+        district_col = shop_df[["fps_shop_id", "district"]].copy()
         shop_df = shop_df.groupby("district", group_keys=False).apply(_district_z)
+        if "district" not in shop_df.columns:
+            shop_df = shop_df.merge(district_col, on="fps_shop_id", how="left")
 
         # ── 8. Optional: merge AAY/PHH card counts from beneficiaries ──────────
         if beneficiaries_df is not None and "fps_shop_id" in beneficiaries_df.columns:
